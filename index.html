@@ -59,6 +59,10 @@
   .rk-t:hover { color: var(--accent); }
   .rk-meta { color: var(--tx2); font-size: 11px; margin-top: 5px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .rk-sub { background: var(--accent2); color: var(--accent); padding: 0 6px; border-radius: 8px; }
+  .tagrow { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+  .kwtag { background: var(--card2); color: var(--tx2); font-size: 10.5px; padding: 1px 7px; border-radius: 9px; cursor: pointer; border: 1px solid transparent; }
+  .kwtag:hover { border-color: var(--accent); color: var(--accent); }
+  .kwtag::before { content: "#"; opacity: .5; }
   .col-more { display: block; text-align: center; margin-top: auto; padding-top: 11px; color: var(--accent); font-size: 12.5px; cursor: pointer; text-decoration: none; }
   .col-more:hover { text-decoration: underline; }
   .col-empty { color: var(--tx2); font-size: 12px; text-align: center; padding: 22px 0; }
@@ -69,8 +73,14 @@
   <h1>📺 综艺资讯归档库</h1>
   <div class="sub" id="sub">加载中…</div>
   <div class="controls">
-    <select id="dateSel"><option value="all">全部日期</option></select>
-    <input id="kw" type="text" placeholder="搜索标题 / 摘要 / 来源关键词…">
+    <select id="timeSel">
+      <option value="all">全部时间</option>
+      <option value="0">今日</option>
+      <option value="7">近7日</option>
+      <option value="30">近30日</option>
+      <option value="undated">日期未知</option>
+    </select>
+    <input id="kw" type="text" placeholder="搜索标题 / 摘要 / 来源 / 标签…">
   </div>
   <div class="controls">
     <div class="tabs" id="tabs"></div>
@@ -118,7 +128,17 @@ function scoreItem(it) {
 }
 
 let DB = [];            // [{date, boards:{key:{name,items:[]}}}]
-let curBoard = 'all', curDate = 'all', curKw = '', curSub = {};
+let curBoard = 'all', curTime = 'all', curKw = '', curSub = {};
+
+// 今天（本地）零点，用于按"发布时间"实时计算天数差（不依赖采集时的 daysAgo）
+const TODAY = (() => { const d = new Date(); d.setHours(0,0,0,0); return d; })();
+// 由 isoDate 现算"距今几天"；无 isoDate 返回 null（=日期未知）
+function pubDaysAgo(it) {
+  if (!it.isoDate) return null;
+  const d = new Date(it.isoDate + 'T00:00:00');
+  if (isNaN(d)) return null;
+  return Math.floor((TODAY - d) / 86400000);
+}
 
 // 数据来自 data.js（window.NEWS_DB），由 build-site.js 生成，兼容 file:// 双击打开
 async function loadAll() {
@@ -130,13 +150,7 @@ async function loadAll() {
 }
 
 function initUI() {
-  const dateSel = document.getElementById('dateSel');
-  DB.forEach(d => {
-    const o = document.createElement('option');
-    o.value = d.date; o.textContent = `${d.date}（${d.total||countDay(d)}条）`;
-    dateSel.appendChild(o);
-  });
-  dateSel.onchange = e => { curDate = e.target.value; render(); };
+  document.getElementById('timeSel').onchange = e => { curTime = e.target.value; render(); };
   document.getElementById('kw').oninput = e => { curKw = e.target.value.trim().toLowerCase(); render(); };
 
   const tabs = document.getElementById('tabs');
@@ -150,7 +164,7 @@ function initUI() {
   BOARD_ORDER.forEach(k => tabs.appendChild(mk(k, BOARD_NAME[k])));
 
   const totalItems = DB.reduce((s,d)=>s+countDay(d),0);
-  document.getElementById('sub').textContent = `共 ${DB.length} 期归档 · ${totalItems} 条资讯 · 数据来自本地 data/ 目录`;
+  document.getElementById('sub').textContent = `共 ${DB.length} 期归档 · ${totalItems} 条资讯 · 时间按消息发布时间`;
 }
 
 function countDay(d){ return BOARD_ORDER.reduce((s,k)=> s + ((d.boards[k]&&d.boards[k].items)?d.boards[k].items.length:0), 0); }
@@ -159,7 +173,17 @@ function matchKw(it){
   if(!curKw) return true;
   return (it.title||'').toLowerCase().includes(curKw)
       || (it.desc||'').toLowerCase().includes(curKw)
-      || (it.author||'').toLowerCase().includes(curKw);
+      || (it.author||'').toLowerCase().includes(curKw)
+      || (it.tags||[]).some(t => t.toLowerCase().includes(curKw));
+}
+
+// 按发布时间筛选：all / 0=今日 / 7=近7日 / 30=近30日 / undated=日期未知
+function matchTime(it){
+  if(curTime === 'all') return true;
+  const da = pubDaysAgo(it);
+  if(curTime === 'undated') return da === null;
+  if(da === null) return false;              // 有时间窗时，日期未知的不进
+  return da <= parseInt(curTime, 10) && da >= 0;
 }
 
 function render() {
@@ -169,15 +193,19 @@ function render() {
   renderBoard(main);
 }
 
-// 收集某板块在当前日期/关键词过滤下的全部条目（带 _date）
+// 收集某板块（跨所有归档日期）的条目，去重(按URL)后套用 时间+关键词 过滤
 function collectItems(bk) {
-  const days = curDate==='all' ? DB : DB.filter(d=>d.date===curDate);
+  const seen = new Set();
   let items = [];
-  days.forEach(d => {
+  DB.forEach(d => {
     const b = d.boards[bk];
-    if (b && b.items) b.items.forEach(it => items.push({...it, _date:d.date}));
+    if (b && b.items) b.items.forEach(it => {
+      if (it.url && seen.has(it.url)) return;
+      if (it.url) seen.add(it.url);
+      items.push({...it, _date:d.date});
+    });
   });
-  return items.filter(matchKw);
+  return items.filter(it => matchTime(it) && matchKw(it));
 }
 
 // 「全部」= 分类榜·多列并排，每列 Top5 按 scoreItem 降序
@@ -230,8 +258,27 @@ function rankEl(it, rank, subNames) {
         ${it.time ? `<span>🕒 ${esc(it.time)}</span>`:''}
         ${host ? `<span>🔗 ${esc(host)}</span>`:''}
       </div>
+      ${tagRow(it)}
     </div>`;
+  wireTags(el);
   return el;
+}
+
+// 主题关键词标签行（可点击→填入搜索框过滤）
+function tagRow(it) {
+  const tags = it.tags || [];
+  if (!tags.length) return '';
+  return `<div class="tagrow">${tags.map(t => `<span class="kwtag" data-kw="${esc(t)}">${esc(t)}</span>`).join('')}</div>`;
+}
+function wireTags(el) {
+  el.querySelectorAll('.kwtag').forEach(chip => {
+    chip.onclick = (e) => {
+      e.stopPropagation();
+      const kw = chip.dataset.kw || '';
+      const box = document.getElementById('kw');
+      box.value = kw; curKw = kw.toLowerCase(); render();
+    };
+  });
 }
 
 function syncTabs() {
@@ -289,11 +336,12 @@ function itemEl(it) {
     <a class="t" href="${it.url}" target="_blank" rel="noopener">${esc(it.title)}</a>
     ${it.desc ? `<div class="desc">${esc(it.desc)}</div>` : ''}
     <div class="meta">
-      <span class="tag">${it._date||''}</span>
       ${it.time ? `<span>🕒 ${esc(it.time)}</span>`:''}
       ${it.author ? `<span>✍ ${esc(it.author)}</span>`:''}
       <a class="src" href="${it.url}" target="_blank" rel="noopener">🔗 ${esc(host)}</a>
-    </div>`;
+    </div>
+    ${tagRow(it)}`;
+  wireTags(el);
   return el;
 }
 function esc(s){ return (s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
